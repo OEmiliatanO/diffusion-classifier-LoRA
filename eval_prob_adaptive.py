@@ -12,7 +12,6 @@ from diffusion.utils import LOG_DIR, get_formatstr
 import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 INTERPOLATIONS = {
     'bilinear': InterpolationMode.BILINEAR,
@@ -41,7 +40,7 @@ def center_crop_resize(img, interpolation=InterpolationMode.BILINEAR):
     return transform(img)
 
 
-def eval_prob_adaptive(unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
+def eval_prob_adaptive(unet, latent, text_embeds, scheduler, device, args, latent_size=64, all_noise=None):
     scheduler_config = get_scheduler_config(args)
     T = scheduler_config['num_train_timesteps']
     max_n_samples = max(args.n_samples)
@@ -71,7 +70,7 @@ def eval_prob_adaptive(unet, latent, text_embeds, scheduler, args, latent_size=6
                 text_embed_idxs.extend([prompt_i] * args.n_trials)
         t_evaluated.update(curr_t_to_eval)
         pred_errors = eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                                 text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss)
+                                 text_embeds, text_embed_idxs, device, args.batch_size, args.dtype, args.loss)
         # match up computed errors to the data
         for prompt_i in remaining_prmpt_idxs:
             mask = torch.tensor(text_embed_idxs) == prompt_i
@@ -96,7 +95,7 @@ def eval_prob_adaptive(unet, latent, text_embeds, scheduler, args, latent_size=6
 
 
 def eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-               text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2'):
+               text_embeds, text_embed_idxs, device, batch_size=32, dtype='float32', loss='l2'):
     assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
     pred_errors = torch.zeros(len(ts), device='cpu')
     idx = 0
@@ -147,14 +146,22 @@ def main():
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
     parser.add_argument('--loss', type=str, default='l2', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
+    parser.add_argument('--gpu', type=int, default=None, help='GPU for running')
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', type=int, required=True)
     parser.add_argument('--n_samples', nargs='+', type=int, required=True)
 
+    # args for lora
+    parser.add_argument('--lora_dir', type=str, default=None, help='LoRA directory (Only for SD2)')
+
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
-
+    
+    if args.gpu is not None:
+        device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
+    else:
+        device = "cpu"
     # make run output folder
     name = f"v{args.version}_{args.n_trials}trials_"
     name += '_'.join(map(str, args.to_keep)) + 'keep_'
@@ -219,6 +226,20 @@ def main():
     formatstr = get_formatstr(len(target_dataset) - 1)
     correct = 0
     total = 0
+
+    # statistics the labels
+    pbar = tqdm.tqdm(idxs_to_eval)
+    stat = {}
+    for i in pbar:
+        image, label = target_dataset[i]
+        if label not in stat:
+            stat[label] = 1
+        else:
+            stat[label] += 1
+        pbar.set_description(f"Statistics the dataset")
+    stat_correct = dict(zip(*[stat.keys(), [0 for i in range(len(stat.keys()))]]))
+
+    # classification
     pbar = tqdm.tqdm(idxs_to_eval)
     for i in pbar:
         if total > 0:
@@ -238,12 +259,17 @@ def main():
                 img_input = img_input.half()
             x0 = vae.encode(img_input).latent_dist.mean
             x0 *= 0.18215
-        pred_idx, pred_errors = eval_prob_adaptive(unet, x0, text_embeddings, scheduler, args, latent_size, all_noise)
+        pred_idx, pred_errors = eval_prob_adaptive(unet, x0, text_embeddings, scheduler, device, args, latent_size, all_noise)
         pred = prompts_df.classidx[pred_idx]
         torch.save(dict(errors=pred_errors, pred=pred, label=label), fname)
         if pred == label:
             correct += 1
+            stat_correct[label] += 1
         total += 1
+
+    cifar10_label_name = ["airplane","automobile", "bird", "cat", "deer","dog", "frog", "horse", "ship", "truck"]
+    for label in stat.keys():
+        print(f"Accuracy ({cifar10_label_name[label]}):{stat_correct[label]*100/stat[label]:.4f} %")
 
 
 if __name__ == '__main__':

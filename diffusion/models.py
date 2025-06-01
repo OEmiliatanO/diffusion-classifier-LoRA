@@ -26,6 +26,9 @@ def get_sd_model(args):
     scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
     pipe = StableDiffusionPipeline.from_pretrained(model_id, scheduler=scheduler, torch_dtype=dtype)
     pipe.enable_xformers_memory_efficient_attention()
+    if args.lora_dir is not None:
+        print(f"Load lora weights from {args.lora_dir}")
+        pipe.load_lora_weights(args.lora_dir)
     vae = pipe.vae
     tokenizer = pipe.tokenizer
     text_encoder = pipe.text_encoder
